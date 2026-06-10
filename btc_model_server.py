@@ -106,19 +106,92 @@ def _fred_series(series_id: str) -> Optional[pd.Series]:
     return pd.Series(val, index=idx).sort_index()
 
 
-def fetch_btc_weekly() -> Optional[pd.Series]:
-    """Weekly BTC close (USD) from CoinGecko market_chart (daily -> weekly)."""
+def _btc_from_coingecko() -> Optional[pd.Series]:
+    """
+    CoinGecko market_chart. The free (keyless) tier no longer allows
+    days=max / interval=daily (returns 401). We:
+      - send a Demo API key if COINGECKO_API_KEY is set (header), and
+      - request the largest window the tier allows (365d keyless),
+        or 'max' when a key is present.
+    """
+    key = os.environ.get("COINGECKO_API_KEY", "").strip()
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-    params = {"vs_currency": "usd", "days": "max", "interval": "daily"}
-    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    prices = r.json().get("prices", [])
-    if not prices:
+    headers = {"accept": "application/json"}
+    if key:
+        # Demo keys use this header; Pro keys use x-cg-pro-api-key.
+        headers["x-cg-demo-api-key"] = key
+    # With a key we can ask for max; without, the free tier caps daily history.
+    attempts = ["max", "365"] if key else ["365"]
+    for days in attempts:
+        params = {"vs_currency": "usd", "days": days, "interval": "daily"}
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            prices = r.json().get("prices", [])
+            if not prices:
+                continue
+            s = pd.Series(
+                [p[1] for p in prices],
+                index=[pd.Timestamp(p[0], unit="ms") for p in prices],
+            ).sort_index()
+            return s
+        except Exception:
+            continue
+    return None
+
+
+def _btc_from_coinbase() -> Optional[pd.Series]:
+    """
+    Keyless fallback: Coinbase Exchange daily candles (granularity=86400).
+    Coinbase caps each request to 300 candles, so we page backwards in
+    ~300-day chunks to assemble multi-year weekly history.
+    """
+    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+    headers = {"User-Agent": "btc-liquidity-model"}
+    end = dt.datetime.utcnow()
+    start_floor = dt.datetime(2015, 1, 1)
+    rows = {}
+    # page back up to ~16 chunks (~13 years)
+    for _ in range(16):
+        start = end - dt.timedelta(days=300)
+        if end <= start_floor:
+            break
+        params = {
+            "granularity": 86400,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        }
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            if not data:
+                break
+            # candle = [time, low, high, open, close, volume]
+            for c in data:
+                rows[int(c[0])] = float(c[4])
+        except Exception:
+            break
+        end = start
+        time.sleep(0.25)  # be polite to the public endpoint
+    if not rows:
         return None
-    s = pd.Series(
-        [p[1] for p in prices],
-        index=[pd.Timestamp(p[0], unit="ms") for p in prices],
-    ).sort_index()
+    idx = [pd.Timestamp(t, unit="s") for t in rows.keys()]
+    s = pd.Series(list(rows.values()), index=idx).sort_index()
+    return s
+
+
+def fetch_btc_weekly() -> Optional[pd.Series]:
+    """Weekly BTC close (USD). Tries CoinGecko, then Coinbase, then None."""
+    s = _btc_from_coingecko()
+    if s is None or len(s) < 60:
+        s2 = _btc_from_coinbase()
+        if s2 is not None and (s is None or len(s2) > len(s)):
+            s = s2
+    if s is None:
+        return None
     s = s[s.index >= pd.Timestamp(START_DATE)]
     return s.resample("W").last().dropna()
 
